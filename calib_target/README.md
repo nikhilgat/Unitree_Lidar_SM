@@ -1,0 +1,74 @@
+# calib_target - checkerboard extraction from Unitree L2 rosbags
+
+**Quick start:** open the worktree folder in VS Code, edit the constants at the top of `main.py`
+(bag folder, board size, range correction, ...) and press **F5** (or `python main.py`). All bags are
+processed silently, no windows open; results go to `results/`.
+Then run `view_results.py` (pick **View results** in the F5 dropdown) for one window with a list of
+all bags: click a bag to see the whole cloud in grey with only the checkerboard coloured.
+
+Finds the checkerboard in each rosbag (`/unilidar/cloud`, mcap) and estimates `T_lidar_target`
+(target -> LiDAR, 4x4).
+
+Shell equivalent (no `main.py`):
+
+```
+python -m calib_target.extract C:\path\to\rosbags --out results          # all bags
+python -m calib_target.extract rosbags\my_lidar_bag3 --out results       # one bag
+  --cols 8 --rows 6 --square 0.095 --frames 200
+```
+
+Per bag it writes `results/<bag>/target.json` (transform, its inverse, quality metrics, walk curve),
+`board.ply` (on-board points, walk-corrected, intensity as grey) and `detection.png`; plus
+`results/summary.csv`. Check `accepted` and `detection.png` before trusting a bag.
+
+## 3D verification (grey scene, coloured board)
+Each bag also gets `scene.ply` (whole accumulated cloud grey, only the detected board coloured by
+intensity - open in CloudCompare) and `scene.png` (static views). Interactive Open3D viewer:
+
+```
+python view_results.py                                  # one window, pick any bag from a list
+python -m calib_target.view results\my_lidar_bag6      # single-bag Open3D window
+python -m calib_target.extract <rosbags> --out results --show   # CLI only: open one per bag
+```
+`main.py` never opens windows; open `scene.ply` in any viewer (VS Code PLY extension, CloudCompare).
+The viewer also draws the fitted pattern outline, the target frame (x red, y green, z blue) and the
+sensor origin. `board_points_in_scene` in the summary counts the coloured points. If the coloured
+patch does not sit on a checkered board in the scene, the detection is wrong. `--no-scene` skips all scene output.
+
+## Method
+1. **Accumulate** all frames of the (static) bag; the L2 scan is non-repeating so density grows.
+2. **Propose** planar segments by normal-consistent region growing (`segment.py`) that could be the sheet.
+3. **Verify** each proposal
+   - reference plane from the saturated (intensity 255 = white) returns;
+   - **range-walk correction**: on this data dark returns are measured up to ~9 cm *nearer* than
+     white ones on the same plane, as a smooth function of intensity. The curve is estimated per
+     bag from the board itself and removed along each ray;
+   - masked NCC of the checker template on the plane-frame intensity image over rotation x
+     translation x polarity x scale, then continuous refinement on the raw points.
+4. **Finalise**: plane refit on corrected on-board points; `T_lidar_target` with origin at the
+   pattern centre, x along the 8-square side, y along the 6-square side, z = board normal facing
+   the sensor.
+5. **Plausibility gate** (`plausible`): connected on-plane region must fit the board, be filled,
+   and have 20-70 % dark points; `accepted` also needs NCC >= 0.4.
+
+## Range correction (empirical, opt-in)
+With the board confirmed as one fixed 95 mm print, the fitted square size still grew from ~105 mm
+(2.2 m) to ~123 mm (0.94 m). That is a distance-dependent scale error in the point cloud. A
+per-ray model `r' = (r - delta) / kappa` fitted over the 9 accepted detections gives
+`delta = 0.245 m, kappa = 0.956` (1.2 mm rms residual on the square size), and re-running with it
+gives 96-100 mm squares at 0.75-2.0 m:
+
+```
+python -m calib_target.extract <rosbags> --out results --range-offset 0.245 --range-scale 0.956
+```
+It is **not** applied by default: it is fitted to the board size, so it is not independent proof.
+Validate it with a tape-measured sensor-to-board distance (e.g. bag 6 reads 0.94 m raw, 0.75 m
+corrected) before using the transforms as an extrinsic. NCC did not improve with it (sizes did).
+
+## Known limitations / open points
+- **180 deg ambiguity**: an even x even checker looks identical rotated 180 deg about its normal.
+  `T_lidar_target_alt` is the other solution; pick with an external cue (e.g. which board edge is up).
+- **Square size** without the range correction is 105-123 mm, not 95 mm (see above).
+- Which plane is "true" (white vs dark returns) is not known without an external reference; the
+  white (saturated) surface is used.
+- Boards near the sensor's zenith, far away (>2 m) or sparsely sampled can score low (bag 9).
